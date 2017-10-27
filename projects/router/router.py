@@ -3,20 +3,14 @@ import socket
 import threading
 import time
 
-Modules = {}
-ModulesLock = threading.Lock()
-
-buses = {}
-busesLock = threading.Lock()
-
-lastMesID = 0
-lastMesIDLock = threading.Lock()
-
+def debug(arg):
+	print(arg)
 
 class Connection:
 
 	def disconnectionRoutine(module):
-		module.connection = None
+		with module.lock:
+			module.connection = None
 
 
 	def connectionRoutine(connect):
@@ -41,14 +35,13 @@ class Connection:
 
 
 class TelecoideModule:
-	uuid = ''
-	connection = None
-	subsriptions = {} # вида { "bus1":{ "type11":{ "subtype111":True } } , "bus2":{ "type21":{ "subtype211":True } , "type22":{ "subtype221":True , None:True } } }
-
-	lock = threading.Lock()
 
 	def __init__(self, uuid):
 		self.uuid = uuid
+		self.connection = None
+		self.subscriptions = {} # вида { "bus1":{ "type11":{ "subtype111":True } } , "bus2":{ "type21":{ "subtype211":True } , "type22":{ "subtype221":True , None:True } } }
+
+		self.lock = threading.Lock()
 
 	def service(self):
 		if self.connection != None:
@@ -57,11 +50,13 @@ class TelecoideModule:
 					byte = bytearray(1000) #TODO немного костыльненько, имеет смысл попробовать переписать
 					count = self.connection.recv_into(byte)
 					if count != 0:
-						jsonString = byte.decode('utf-8').replace('\x00', '')
-						print(jsonString)
+						jsonString = byte.decode('utf-8').replace('\x00', '')						
 						message = json.loads(jsonString)
-						print(message)
-						message["mesid"] = Core.newMesID
+						message["mesid"] = Core.newMesID()
+
+						debug("Got message")
+						debug(message)
+						debug("")
 
 						Core.route(message) #FIXME переписать потокобезопасно и в отдельном потоке
 
@@ -72,72 +67,92 @@ class TelecoideModule:
 
 
 	def sendMessage(self, message):
-		with self.lock:
-			if self.isSubscribed(message):
-				messageString = json.dumps(message)
-				self.connection.send( messageString.encode('utf-8') )
+		
+		debug("Sending message")
+		debug(message)
+		debug("To module")
+		debug(self.uuid)
+		debug("")
 
-
-	def isSubscribed(self, message):
-		correctBusSubs = {}
-		correctBusSubs.update( self.subsriptions.get( None ) )
-		correctBusSubs.update( self.subsriptions.get( message["bus"] ) )
-
-		correctTypeSubs = {}
-		correctTypeSubs.update( correctBusSubs.get(None) )
-		correctTypeSubs.update( correctBusSubs.get( message["type"] ) )
-
-		return correctTypeSubs.get( None ) or correctTypeSubs.get( message["subtype"] )
+		messageString = json.dumps(message)
+		self.connection.send( messageString.encode('utf-8') )
 
 
 
 class Core(TelecoideModule):
 
+	modules = {}
+	modulesLock = threading.Lock()
+
+	buses = {}
+	busesLock = threading.Lock()
+
+	lastMesID = 0
+	lastMesIDLock = threading.Lock()
+
 	# Функции, чтобы вести себя, как модуль (для обработки сообщений о подписке)
+
 	def __init__(self):
 		super(Core, self).__init__("00000000-0000-0000-0000-000000000000")
 
-		with ModulesLock:
-			Modules["00000000-0000-0000-0000-000000000000"] = self
+		with Core.modulesLock:
+			Core.modules["00000000-0000-0000-0000-000000000000"] = self
 
-		Core.registerModuleSubscription( self, { "bus":"core", "type":None, "subtype":None } )
+		Core.registerModuleSubscription( self, { "bus":"core", "type":"any", "subtype":"any" } )
 
 	def service(self):
 		return
 
 	def sendMessage(self, message):
-		print("Core have a message!")
+
+		debug("Core have a message")
+		debug(message)
+		debug("")
+
 		if message["bus"] == "core" and message["type"] == "subscription":
 			
 			if message["subtype"] == "add":
-				Core.registerModuleSubscription( Modules[ message[ "uuid" ] ], message[ "payload" ])
+				Core.registerModuleSubscription( Core.getModuleByUUID( message[ "uuid" ] ), message[ "payload" ])
 
 			#elif message["subtype"] == "remove": TODO реализовать отписку
 
 
 	# Сервисная функциональность
+
 	def registerModuleSubscription(module, message):
 		
-		busName = message.get("bus")
-		typeName = message.get("type")
-		subtypeName = message.get("subtype")
+		busName = message["bus"]
+		typeName = message["type"]
+		subtypeName = message["subtype"]
 
-		with busesLock:
+		debug("Registering subscription")
+		debug(busName)
+		debug(typeName)
+		debug(subtypeName)
+		debug(module.uuid)
+		debug("")
 
-			if buses.get( busName ) == None:
-				buses[ busName ] = []
+		with Core.busesLock:
 
-			buses[ busName ].append(module)
+			if Core.buses.get( busName ) == None:
+				Core.buses[ busName ] = []
 
-			print(buses)
+			if module not in Core.buses[ busName ]:
+				Core.buses[ busName ].append(module)
+
+			debug("Buses dict")
+			debug(Core.buses)
+			debug("")
 
 
 		with module.lock:
 
-			busDict = module.subsriptions.get( busName )
+			moduleSubs = module.subscriptions
+
+			busDict = moduleSubs.get( busName )
 			if busDict == None:
-				module.subsriptions[busName] = {}
-				busDict = module.subsriptions[busName]
+				moduleSubs[busName] = {}
+				busDict = moduleSubs[busName]
 
 			typeDict = busDict.get( typeName )
 			if typeDict == None:
@@ -146,15 +161,17 @@ class Core(TelecoideModule):
 
 			typeDict[ subtypeName ] = True		
 		
-			for module in Modules.values():
-				print(module.subsriptions)
+			debug("Subs dict of module with uuid")
+			debug(module.uuid)
+			debug(module.subscriptions)
+			debug("")
 
 
 
 	def route(message):
-		with busesLock: #TODO немного костыльненько, имеет смысл попробовать переписать
-			subscribersBus = buses.get( message["bus"] )
-			subscribersAny = buses.get( None )
+		with Core.busesLock: #TODO немного костыльненько, имеет смысл попробовать переписать
+			subscribersBus = Core.buses.get( message["bus"] )
+			subscribersAny = Core.buses.get( "any" )
 	
 		subscribers = []
 		if subscribersBus != None:
@@ -167,26 +184,59 @@ class Core(TelecoideModule):
 			return
 
 		for module in subscribers:
-			module.sendMessage(message)
+			with module.lock:
+				if Core.isModuleSubscribed(module, message):
+					module.sendMessage(message)
 
+	def isModuleSubscribed(module, message):
+		subs = module.subscriptions
+
+		correctBusSubs = {}
+
+		try:
+			correctBusSubs.update( subs.get( "any" ) )
+		except TypeError:
+			pass
+
+		try:
+			correctBusSubs.update( subs.get( message["bus"] ) )
+		except TypeError:
+			pass
+
+		correctTypeSubs = {}
+
+		try:
+			correctTypeSubs.update( correctBusSubs.get( "any" ) )
+		except TypeError:
+			pass
+
+		try:
+			correctTypeSubs.update( correctBusSubs.get( message["type"] ) )
+		except TypeError:
+			pass
+
+		if ( correctTypeSubs.get( "any" ) != None ) or ( correctTypeSubs.get( message["subtype"] ) != None ):
+			return True
+
+		return False
 
 	def newMesID():
 		id = 0;
-		with lastMesIDLock:
-			lastMesID += 1
-			id = lastMesID
+		with Core.lastMesIDLock:
+			Core.lastMesID += 1
+			id = Core.lastMesID
 
 		return id
 
 	def getModuleByUUID(uuid):
-		with ModulesLock:
-			module = Modules.get(uuid)
+		with Core.modulesLock:
+			module = Core.modules.get(uuid)
 			if module == None:
 				module = TelecoideModule(uuid)
-				Modules[uuid] = module
+				Core.modules[uuid] = module
 
 		return module
 
 #On start
-Core()
+Core() # Инстанцируем ядерный модуль
 Connection.awaitConnection(54231)
